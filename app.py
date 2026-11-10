@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import re
 import time
 import subprocess
 import requests
@@ -345,17 +346,22 @@ def _read_alert(sb):
         return ""
 
 
-def _goto_server_detail(sb) -> bool:
-    """在 Dashboard 首页查找并点击 See 进入服务器详情页"""
+def _goto_server_detail(sb):
+    """在 Dashboard 首页查找并点击 See 进入服务器详情页。
+
+    返回 (到了详情页, 是否到续期时间)：
+    未到续期时间时也继续进详情页（只做服务状态检查），不直接返回。
+    """
     print("\n🖥️  正在进入服务器续期页...")
     time.sleep(5)
 
     # 检查页面顶部是否已有"还无法续期"全局提示
+    renewal_due = True
     alert_text = _read_alert(sb)
     if alert_text and "can't renew" in alert_text.lower():
         print(f"ℹ️  页面顶部提示: {alert_text}")
         send_tg_message("ℹ️", "⚠️ 未到续期时间", alert_text)
-        return False
+        renewal_due = False
 
     # 多种选择器尝试查找 See 链接
     selectors = [
@@ -404,13 +410,13 @@ def _goto_server_detail(sb) -> bool:
         except Exception:
             pass
         sb.save_screenshot("servers_page_fail.png")
-        return False
+        return (False, False)
 
     print("🖱️  点击 'See' 进入服务器详情页...")
     see_link.click()
     time.sleep(5)
     print(f"📄 当前页面: {sb.get_current_url()}")
-    return True
+    return (True, renewal_due)
 
 
 def _open_renew_modal(sb) -> bool:
@@ -565,7 +571,7 @@ def _submit_renew(sb):
 
 
 def _check_renew_result(sb):
-    """读取页面 alert 提示，判断续期结果并推送 TG 通知"""
+    """读取页面 alert 提示，判断续期结果并推送 TG 通知；返回 True 表示续期成功"""
     print("\n📋 检查续期结果...")
     alert_text = _read_alert(sb)
     if not alert_text:
@@ -577,33 +583,215 @@ def _check_renew_result(sb):
         low = alert_text.lower()
         if "can't renew" in low or "unable" in low:
             send_tg_message("⏳", "未到续期时间", alert_text)
+            return False
         elif any(kw in low for kw in ( "renewed", "success", "extended")):
             send_tg_message("✅", "续期成功", alert_text)
+            return True
         else:
             send_tg_message("ℹ️", "续期操作已执行", alert_text)
+            return False
     else:
         print("ℹ️ 未检测到明确的提示框，可能续期操作未生效")
         send_tg_message("ℹ️", "续期操作已执行", "未检测到明确提示")
+        return False
+
+
+# ===== 续期后自动启动服务 =====
+
+SUB_URL = "http://51.75.118.5:20343/sub"  # 法国节点订阅地址
+
+def _sub_ok() -> bool:
+    """直接请求 /sub，200 即服务在运行"""
+    try:
+        r = requests.get(SUB_URL, timeout=15)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _fetch_argo_domain() -> str:
+    """从 /sub 内容里解析新的 Argo 临时域名（trycloudflare.com），解析不到返回空串"""
+    try:
+        r = requests.get(SUB_URL, timeout=15)
+        if r.status_code != 200:
+            return ""
+        text = r.text or ""
+        m = re.search(r"([A-Za-z0-9-]+\.trycloudflare\.com)", text)
+        if m:
+            return m.group(1)
+        # 订阅可能是 base64，解码后再找
+        try:
+            import base64
+            cleaned = "".join(text.split())
+            cleaned += "=" * (-len(cleaned) % 4)
+            decoded = base64.b64decode(cleaned).decode("utf-8", errors="ignore")
+            m = re.search(r"([A-Za-z0-9-]+\.trycloudflare\.com)", decoded)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        return ""
+    except Exception:
+        return ""
+
+
+def _click_start(sb) -> bool:
+    """在服务器详情页查找并点击 Start 按钮；找到并点击返回 True，否则 False"""
+    print("\n▶️  查找 Start 按钮...")
+    # 先处理可能出现的 Turnstile
+    try:
+        if sb.execute_script(_EXISTS_JS) and not sb.execute_script(_SOLVED_JS):
+            print("  检测到 Turnstile，先处理验证...")
+            handle_turnstile(sb)
+    except Exception:
+        pass
+
+    start_btn = None
+    # 方式1：按按钮文本找
+    try:
+        for b in sb.find_elements("button"):
+            if (b.text or "").strip().lower() == "start":
+                start_btn = b
+                break
+    except Exception:
+        pass
+    # 方式2：按常见 class 找（Start 常为绿色 btn-success）
+    if start_btn is None:
+        for sel in ['button.btn-success', 'button[data-bs-target="#start-modal"]', 'a.btn-success']:
+            try:
+                start_btn = sb.find_element(sel, timeout=3)
+                break
+            except Exception:
+                continue
+
+    if start_btn is None:
+        print("  未找到 Start 按钮（可能服务已在运行，或页面未加载出按钮）")
+        return False
+
+    try:
+        if not start_btn.is_enabled():
+            print("  Start 按钮不可点（disabled）")
+            return False
+    except Exception:
+        pass
+
+    try:
+        sb.execute_script("arguments[0].scrollIntoView({block:'center'});", start_btn)
+    except Exception:
+        pass
+    time.sleep(0.5)
+    try:
+        start_btn.click()
+    except Exception:
+        try:
+            sb.execute_script("arguments[0].click();", start_btn)
+        except Exception as e:
+            print(f"  点击 Start 失败: {e}")
+            return False
+    print("🖱️  已点击 Start")
+    time.sleep(5)
+
+    # 点击后可能弹出确认框或 Turnstile
+    try:
+        if sb.execute_script(_EXISTS_JS) and not sb.execute_script(_SOLVED_JS):
+            print("  点击后出现 Turnstile，处理中...")
+            handle_turnstile(sb)
+    except Exception:
+        pass
+    # 确认框里可能有 Confirm/Start 提交按钮
+    try:
+        modal = sb.find_element('div.modal.show', timeout=4)
+        if modal:
+            for b in sb.find_elements('div.modal.show button'):
+                t = (b.text or "").strip().lower()
+                if t in ("start", "confirm", "确认", "yes"):
+                    b.click()
+                    print("🖱️  已点击确认框中的提交按钮")
+                    break
+    except Exception:
+        pass
+    time.sleep(3)
+    return True
+
+
+def _ensure_server_running(sb, renewed: bool) -> bool:
+    """续期后（每次运行时都跑）确保服务在运行。
+
+    /sub 通即正常；不通则点 Start 并轮询等恢复（最多约 15 分钟）。
+    只有实际点了 Start 或最终仍不通时才发 TG 通知，避免每天打扰。
+    """
+    print("\n" + "#" * 25)
+    print("  检查服务是否在运行")
+    print("#" * 25)
+
+    start_clicked = False
+    last_click_round = -10
+    max_rounds = 30  # 30 轮 x 约 30 秒 ≈ 15 分钟
+    for round_no in range(1, max_rounds + 1):
+        if _sub_ok():
+            print(f"✅ /sub 已通（第 {round_no} 轮）")
+            if start_clicked:
+                domain = _fetch_argo_domain()
+                msg = "续期成功，服务已自动启动，/sub 正常"
+                if domain:
+                    msg += f"\n🌐 新 Argo 域名: {domain}\n（客户端 Host/SNI 请更新为该域名）"
+                send_tg_message("✅", msg)
+            elif renewed:
+                print("ℹ️ 续期后服务本身就是通的，无需启动")
+            else:
+                print("ℹ️ 服务正常，无需操作")
+            return True
+
+        print(f"⚠️ 第 {round_no} 轮：/sub 不通，尝试启动服务...")
+        # 距上次点击已过 3 轮（约 90 秒）才允许再点一次，避免重复点击
+        if round_no - last_click_round >= 3:
+            if _click_start(sb):
+                start_clicked = True
+                last_click_round = round_no
+            else:
+                print("  本轮未找到可点的 Start 按钮，稍后重试")
+
+        # 刷新详情页，等待后继续轮询
+        try:
+            sb.refresh()
+            time.sleep(5)
+        except Exception:
+            pass
+        time.sleep(25)
+
+    print("❌ 轮询超时：/sub 仍不通")
+    send_tg_message("⚠️", "续期成功，但服务启动超时，/sub 仍不通，请手动去面板点 Start")
+    return False
 
 
 def renew_server(sb):
-    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交"""
+    """登录成功后调用：自动进入详情页 -> Renew -> 提交 -> 确保服务在运行"""
     print("\n" + "#" * 25)
     print("  开始自动续期流程")
     print("#" * 25)
 
-    if not _goto_server_detail(sb):
+    reached, due = _goto_server_detail(sb)
+    if not reached:
         return
 
-    if not _open_renew_modal(sb):
-        return
+    renewed = False
+    if due:
+        if _open_renew_modal(sb):
+            # altcha_ok = _solve_altcha(sb)
+            # if not altcha_ok:
+            #     print("⚠️ ALTCHA 验证未通过，仍尝试提交 Renew...")
 
-    # altcha_ok = _solve_altcha(sb)
-    # if not altcha_ok:
-    #     print("⚠️ ALTCHA 验证未通过，仍尝试提交 Renew...")
+            _submit_renew(sb)
+            renewed = _check_renew_result(sb)
+    else:
+        print("ℹ️ 未到续期时间，跳过 Renew，只检查服务状态")
 
-    _submit_renew(sb)
-    _check_renew_result(sb)
+    # 续期后服务可能没自启（2026-11-10 教训）；每次运行都确保服务在运行
+    try:
+        _ensure_server_running(sb, renewed)
+    except Exception as e:
+        print(f"⚠️ 服务自检异常（不影响续期结果）: {e}")
+        send_tg_message("⚠️", "续期已执行，但服务自检异常，请手动确认 /sub 是否正常")
 
 
 #  脚本执行入口 (可选代理)
